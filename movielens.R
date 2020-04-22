@@ -46,6 +46,7 @@ rm(dl, ratings, movies, test_index, temp, movielens, removed)
 
 saveRDS(validation, "validation")
 saveRDS(edx, "edx")
+saveRDS(movielens, "movielens")
 
 
 # create data partition for training and testing algorithm ----------------
