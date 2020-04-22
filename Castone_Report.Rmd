@@ -1,0 +1,573 @@
+---
+title: "Capstone Report"
+subtitle: "Project Movielens"
+author: "Simon Passek"
+date: "`r Sys.Date()`"
+output: 
+  tint::tintPdf:
+    number_sections: true
+    toc: true
+    df_print: kable
+bibliography: movielens_capstone.bib
+link-citations: yes
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+if (!require("pacman")) install.packages("pacman"); 
+pacman::p_load("tint", "tidyverse", "data.table", "janitor", "caret", "lubridate")
+# invalidate cache when the package version changes
+knitr::opts_chunk$set(tidy = FALSE, cache.extra = packageVersion('tint'))
+options(htmltools.dir.version = FALSE)
+
+edx <- readRDS("edx")
+validation <- readRDS("validation")
+movielens <- readRDS("movielens")
+```
+```{marginfigure}
+[layout based on the package tint]("https://eddelbuettel.github.io/tint/)
+```
+
+# Introduction
+
+In one part of the edX course series  ["Data Science Professional Certificate"](https://courses.edx.org/dashboard) from Rafael Irizarry, the capstone task, named MovieLens Project, is to build a prediction algorithm for movie ratings. As a motivating example a recommendation challenge for the data science community is mentioned, in which Netflix offered one million dollars for the data science team, that would improves the movie recommendation system by 10 %.
+The Netflix data is not publicly available, so Professor Irizarry provides links to the GroupLens research lab database.\hfill\break\break 
+The dataset downloaded from there, comprises of `r dim(movielens)[1]` observations with `r dim(movielens)[2]` recorded features.
+
+```{r,  fig.fullwidth = TRUE, echo=FALSE, fig.cap="A subset of the data with recorded features"}
+knitr::kable(movielens[1:6, 1:6], 
+             caption = "A subset of the data with recorded features")
+```
+
+\hfill\break Each row represents a user rating a certain movie with values between 0 (the worst possible rating) and  `r range(movielens$rating)[2]` (the best possible rating). 
+
+```{r, echo=FALSE, fig.caption = "frequency distribution of ratings"}
+tabyl(edx$rating) %>% knitr::kable(caption = "frequency distribution of ratings")
+```
+
+\hfill\break In the dataset used in the MovieLens project `r movielens %>% summarize(dist = n_distinct(userId)) %>% .$dist` distinct users rate `r movielens %>% summarize(dist = n_distinct(movieId)) %>% .$dist` distinct movies.
+
+```{r, echo = FALSE, fig.caption = "distinct users and movies"}
+movielens %>% summarize(n_distinct_users = n_distinct(userId), 
+                        n_distinct_movies = n_distinct(movieId)) %>% 
+  knitr::kable(caption = "distinct users and movies")
+```
+
+\hfill\break If every user rates every movie our dataset should comprise of `r movielens %>% summarize(n_distinct_users = n_distinct(userId), n_distinct_movies = n_distinct(movieId)) %>% summarize(multiplied = n_distinct_users*n_distinct_movies) %>% .$multiplied ` rows. But the actual data set has only `r nrow(movielens)` rows. This implies that not every user rated every movie. 
+In the MovieLens Project one could implement information of a specific user, movie and related movies to predict the rating of that specific user on a new, unknown movie. 
+
+# Analysis
+
+## Exploratory data analysis
+
+In order to only use the train dataset for exploration/training of the prediction algorithm we will look at a data partition of the MovieLens data. This subset is termed edx and comprises of `r dim(edx)[1]` observations.
+
+
+```{r, fig.cap="number of ratings per user", message=FALSE, warning=FALSE, cache = TRUE}
+edx %>% group_by(userId) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(n),col = "black") + 
+  geom_histogram(color = "black") + 
+  xlim(0, 1000)+scale_x_log10()+
+  labs(x = "number of ratings", 
+       y = "count of distinct users")
+```
+
+\hfill\break Some users seem to rate every movie they watch, whereas others rate more rarely. 
+
+```{r, fig.cap="number of ratings per movie", message=FALSE, warning=FALSE, cache = TRUE, echo = FALSE}
+
+edx %>% 
+  group_by(movieId) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(n))+
+  geom_histogram(color = "black")+
+  scale_x_log10()+
+  labs(x = "number of ratings", 
+       y = "count of distinct movies")
+```
+
+\hfill\break The same trend can be seen in the number of ratings per movie. Some movies seem to be pretty popular, whereas others are only rated by few users.
+
+```{r, fig.cap = "mean rating of individual movies", message=FALSE, warning=FALSE, cache = TRUE}
+
+edx %>% 
+  group_by(movieId) %>% 
+  summarize(n_movies = n(), mean_rating = mean(rating)) %>% 
+  arrange(n_movies) %>% 
+  mutate(cut_movies = cut(n_movies, 
+                          breaks = quantile(
+                            n_movies, 
+                            probs = seq(0, 1, 0.1)))) %>%
+  filter(!is.na(cut_movies)) %>% 
+  ggplot(aes(mean_rating, fill = cut_movies))+
+  geom_histogram()+scale_fill_discrete(
+    name = "number of movie observations")
+
+```
+
+\hfill\break No real trend is observed. Independent of users or number of ratings, some movies tend to have higher mean_ratings than others. In the following analysis this observation is called "movie-effects".
+
+\hfill\break
+\hfill\break
+
+```{r, warning=FALSE, message = FALSE , fig.cap="mean rating of individual users 1", cache = TRUE}
+edx %>% 
+  group_by(userId) %>% 
+  summarize(n_user = n(), mean_rating = mean(rating)) %>% 
+  mutate(cut_users = cut(n_user, 
+                         breaks = quantile(
+                           n_user,
+                           probs = seq(0, 1, 0.1)))) %>% 
+  filter(!is.na(cut_users)) %>% 
+  ggplot(aes(mean_rating, fill = cut_users)) + 
+  geom_histogram()+
+  labs(x = "mean_rating of users")+
+  scale_fill_discrete("number of ratings per user")
+```
+
+\hfill\break Some users seem to give better mean_ratings then other users, independent of the number of ratings per user and the acutal movie. In the following analysis this observation is called "user-effects".
+
+```{r, fig.margin = TRUE, echo = FALSE, fig.cap="mean rating of individual users 2", fig.height=6, fig.width=4, cache = TRUE}
+edx %>% group_by(userId) %>% 
+  summarize(n_user = n(), mean_rating = mean(rating)) %>% 
+  filter(n_user > 2500) %>% 
+  ggplot(aes(x = reorder(userId, mean_rating), y = mean_rating))+
+  geom_point()+
+  coord_flip()
+```
+
+```{r, fig.cap="mean_rating per genre", fig.height=8, fig.width=6, fig.cap="mean rating per genre 1", cache = TRUE}
+edx %>% 
+  group_by(genres) %>% 
+  summarize(n_genres = n(), mean_rating = mean(rating)) %>% 
+  filter(n_genres > 50000) %>% 
+  ggplot(aes(x = reorder(genres, mean_rating), 
+             y = mean_rating))+
+  geom_point()+
+  coord_flip()
+```
+
+```{r, fig.margin = TRUE, message=FALSE, warning=FALSE, fig.cap="mean rating per genre 2", echo=FALSE, cache = TRUE}
+edx %>% 
+  group_by(genres) %>% 
+  summarize(n_genres= n(), mean_rating = mean(rating)) %>% 
+  mutate(
+    cut_genres = cut(n_genres, 
+                          breaks = quantile(
+                            n_genres, 
+                            probs = seq(0, 1, 0.1)))) %>% 
+  filter(!is.na(cut_genres)) %>% 
+  ggplot(aes(mean_rating, fill = cut_genres))+
+  geom_histogram()
+```
+
+\hfill\break Independent of users, different genres have different mean_ratings. In the following analysis this observation is termed "genres-effects".
+
+
+```{r, message=FALSE, warning=FALSE, fig.cap= "time dependency of movie ratings"}
+edx %>% 
+  mutate(date_time = lubridate::as_datetime(timestamp)) %>% 
+  mutate(week = 
+           lubridate::round_date(date_time, 
+                                      unit = "week")) %>% 
+  group_by(week) %>% 
+  summarize(n_week = n(), mean_rating = mean(rating)) %>% 
+  ggplot(aes(week, mean_rating))+
+  geom_point()+
+  geom_smooth(color = "darkred")
+```
+
+\hfill\break The mean_rating across movies, genres, users also seems to be time dependent. 
+In the following analysis this observation is termed "week-effects".
+
+## Modelling approaches
+
+In order to not overtrain or overfit a model, the train datapartition edx also has to be split in train- and test-set. To build the algorithm only the test set is going to be used.
+
+```{r, eval=FALSE}
+
+# create train and test data set
+set.seed(1, sample.kind = "Rounding")
+
+test_index <- createDataPartition(edx$rating, times = 1, p = 0.2, list = FALSE)
+
+train_set_incomplete <- edx[-test_index,]
+test_set_incomplete <- edx[test_index,]
+
+# to make sure to have the same movieIds and userIds in train- and test_set
+test_set <- test_set_incomplete %>% 
+  semi_join(train_set_incomplete, by = "movieId") %>% 
+  semi_join(train_set_incomplete, by = "userId")
+
+#row_bind the dropped rows to the train_set
+removed <- anti_join(test_set_incomplete, test_set)
+train_set <- rbind(train_set_incomplete, removed)
+saveRDS(train_set, "train_set")
+saveRDS(test_set, "test_set")
+```
+
+```{r}
+# load data set
+train_set <- readRDS("train_set")
+test_set <- readRDS("test_set")
+
+# using library(lubridate) to transform the timestamp into date format
+
+train_set <- train_set %>% 
+  mutate(date = lubridate::as_datetime(timestamp))
+train_set  <- train_set %>% 
+  mutate(week = lubridate::round_date(date, "week"))
+
+test_set <- test_set %>% 
+  mutate(date = lubridate::as_datetime(timestamp))
+test_set <- test_set %>% 
+  mutate(week = lubridate::round_date(date, "week"))
+```
+
+To evaluate the performance of different models, a loss function is needed.
+In the MovieLens project, as in the Netflix challenge, the residual mean squared error (RMSE) is used.
+
+```{r eval = FALSE}
+RMSE <- function(true_ratings, predicted_ratings){
+    sqrt(mean((true_ratings - predicted_ratings)^2))
+  }
+```
+
+Taking together the four effects(user-effects(u), movie-effects(i), genres-effects(g), week-effects(w)) observed in the exploratory data analysis, the first model could look like this:
+
+$Y_{u, i, g, w} = \mu + b_{u}+b_{i}+b_{g}+b_{w}+\varepsilon_{u, i, g, w}$
+
+\hfill\break with the bs as "effects" and $\varepsilon_{u, i, g, w}$ as independend errors by random variation.
+\hfill\break As descriped in the corresponding chapter of Rafael Irizarry´s book ["Introduction to Data Science"]("https://rafalab.github.io/dsbook/large-datasets.html#recommendation-systems") one can use the least squares to estimate the effects $b_{u}, b_{i}, b_{g}, b_{w}$:
+
+```{r}
+  mu <- mean(train_set$rating)
+  
+  movie_effects_reg <- train_set %>% 
+    group_by(movieId) %>% 
+    summarize(b_i = mean(rating - mu))
+  
+  user_effects_reg <- train_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    group_by(userId) %>% 
+    summarize(b_u = mean(rating - mu - b_i)) 
+  
+  genre_effects_reg <- train_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    left_join(user_effects_reg, by = "userId") %>% 
+    group_by(genres) %>% 
+    summarize(b_g = mean(rating- mu - b_i - b_u))
+  
+  week_effects_reg <- train_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    left_join(user_effects_reg, by = "userId") %>% 
+    left_join(genre_effects_reg, by = "genres") %>% 
+    group_by(week) %>% 
+    summarize(b_w = mean(rating - mu - b_i - b_u - b_g))
+  
+  prediction <- test_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    left_join(user_effects_reg, by = "userId") %>% 
+    left_join(genre_effects_reg, by = "genres") %>% 
+    left_join(week_effects_reg, by = "week") %>% 
+    mutate(pred = mu+b_i+b_u+b_g+b_w) %>% 
+    pull(pred)
+  
+  
+  rmse <- caret::RMSE(test_set$rating, prediction)
+  
+rmse
+
+```
+
+Let´s explore the largest mistakes of the prediction:
+
+```{r}
+errors <- test_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    left_join(user_effects_reg, by = "userId") %>% 
+    left_join(genre_effects_reg, by = "genres") %>% 
+    left_join(week_effects_reg, by = "week") %>% 
+    mutate(residual = rating - (mu+b_i+b_u+b_g+b_w), 
+           prediction = mu+b_i+b_u+b_g+b_w) %>% 
+  arrange(desc(abs(residual)))
+
+errors[1:5, c("movieId",  "residual", "rating")] %>% 
+  knitr::kable(caption = 
+                 "the 5 largest residuals in the training set")
+```
+
+\hfill\break The largest mistakes seem to be made when predicting rather obscure movies, with very large or very small ratings.
+
+\hfill\break Lets look at the training data, based on which the predictions were made:
+
+```{r}
+# subset errors
+errors_subset <- errors %>% 
+  group_by(movieId) %>% 
+  summarize(mean_residual = mean(abs(residual))) %>% 
+  arrange(desc(abs(mean_residual)))
+
+
+# look at the number of observations with the biggest prediction errors
+
+train_set %>% 
+  right_join(errors_subset, by = "movieId") %>% 
+  group_by(movieId) %>% 
+  summarize(n_movie = n(), mean_residual = mean(abs(mean_residual)), 
+            mean_rating = mean(rating)) %>% 
+  arrange(desc(abs(mean_residual))) %>% 
+  slice(1:10) %>% 
+  knitr::kable(caption = "the 10 worst predictions based on the training data")
+```
+
+\hfill\break The biggest absolute errors are observed, when predicting ratings with just a view observed movies. Even with the model taking into account all four observed effects, the residuals are largest in the movies with a low number of observations.
+
+```{r}
+train_set %>% 
+  right_join(errors_subset, by = "movieId") %>% 
+  group_by(movieId) %>% 
+  summarize(n_movie = n(), mean_residual = mean(abs(mean_residual)), 
+            mean_rating = mean(rating)) %>% 
+  arrange(desc(abs(mean_residual))) %>% 
+  slice(1:100) %>% 
+  summarize(mean_n = mean(n_movie), mean_mean_residual = mean(abs(mean_residual)))
+```
+
+The biggest 100 mean_errors stratified by movieId have an average number of observations in the train_set of 8.2.
+
+\hfill\break When looking at the numbers of ratings from each recoreded user, a similar observation can be made.
+
+```{r}
+errors_subset <- errors %>% 
+  group_by(userId) %>% 
+  summarize(mean_residual = mean(abs(residual))) %>% 
+  arrange(desc(abs(mean_residual)))
+
+
+train_set %>% 
+  right_join(errors_subset, by = "userId") %>% 
+  group_by(userId) %>% 
+  summarize(n_user = n(), 
+            mean_residual = mean(mean_residual), 
+            mean_rating = mean(rating)) %>% 
+  arrange(desc(abs(mean_residual))) %>% 
+  slice(1:100) %>% 
+  summarize(mean_n = mean(n_user), 
+            mean_mean_residual = mean(abs(mean_residual)))
+```
+
+\hfill\break The largest 100 mean_errors stratified by userId have an average number of observations in the train_set of 25.
+
+
+\hfill\break With only a view users rating a movie in our train_set sample, we have much uncertainty about the true movie rating in the population. The idea of **regularization** is to penalize the least squares estimates, which have few numbers of observations.
+To formulate this mathematically for a penalized effect $b_{i}$:
+
+$$
+\hat{b}_i(\lambda) = \frac{1}{\lambda + n_i} \sum_{u=1}^{n_i} \left(Y_{u,i} - \hat{\mu}\right)
+$$
+
+\hfill\break where $\lambda$ is the penalty term and $n_{i}$ is the number of observations. 
+If $n_{i}$ is large, $\lambda$ has almost no impact on $\hat{b}_i(\lambda)$. But if $n_{i}$ is small, the penalty induced by $\lambda$ is large.^[[Introduction to Data Science by Rafael Irizarry]("https://rafalab.github.io/dsbook/large-datasets.html#recommendation-systems")]
+
+## Regularization approach
+
+The $\lambda$ can be seen as a typical machine learning tuning parameter.
+To select the best tuning parameter only the train_set data should be used. Therefore 5 bootstrap cross validations are used to select the optimal value for $\lambda$.
+
+```{r, warning = FALSE, message=FALSE, comment=FALSE}
+lambdas = seq(4, 6, 0.1)
+
+set.seed(1, sample.kind = "Rounding")
+
+B <- 5 # number of bootstrap iterations
+
+rmse_bootstrapping <- replicate(B, {
+  
+  #create bootstrap sample without using test_set
+  boots_index <- sample(1:nrow(train_set),replace = TRUE, size = 1440018)
+  train_set_boots <- train_set[-boots_index,]
+  test_sub <- train_set[boots_index,] # 20 % of the test_set as bootstrap validation set
+  
+  # make sure users and movies of train set are in the test set
+  test_set_boots <- test_sub %>% 
+    semi_join(train_set_boots, by = "movieId") %>% 
+    semi_join(train_set_boots, by = "userId")
+  
+  lost <- anti_join(test_sub, test_set_boots)
+  
+  train_set_boots <- rbind(train_set_boots, lost)
+  
+  
+  rmse <- map_df(lambdas, function(x){
+    
+    mu <- mean(train_set_boots$rating)
+    
+   # movie effects with regularization 
+    movie_effects_reg <- train_set_boots %>% 
+      group_by(movieId) %>% 
+      summarize(b_i = sum(rating - mu)/(n()+x))
+    
+   # user effects with regularization  
+    user_effects_reg <- train_set_boots %>%  
+      left_join(movie_effects_reg, by = "movieId") %>% 
+      group_by(userId) %>% 
+      summarize(b_u = sum(rating - mu - b_i)/(n()+x))
+    
+   # genres effects with regularization
+    genres_effects_reg <- train_set_boots %>% 
+      left_join(movie_effects_reg, by = "movieId") %>% 
+      left_join(user_effects_reg, by = "userId") %>% 
+      group_by(genres) %>% 
+      summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+x))
+    
+   # week effects with regularization
+    week_effects_reg <- train_set_boots %>% 
+      left_join(movie_effects_reg, by = "movieId") %>% 
+      left_join(user_effects_reg, by = "userId") %>%
+      left_join(genres_effects_reg, by = "genres") %>% 
+      group_by(week) %>% 
+      summarize(b_w = sum(rating - mu - b_i - b_u - b_g)/(n()+x))
+    
+   # making the prediction on the test set 
+    prediction <- test_set_boots %>% 
+      left_join(movie_effects_reg, by = "movieId") %>% 
+      left_join(user_effects_reg, by = "userId") %>%
+      left_join(genres_effects_reg, by = "genres") %>% 
+      left_join(week_effects_reg, by = "week") %>%  
+      mutate(pred = mu + b_i + b_u + b_g + b_w) %>% 
+      pull(pred)
+    
+    # calculating RMSE
+    rmse <- RMSE(prediction[which(!is.na(prediction))], 
+                 test_set_boots$rating[which(!is.na(prediction))])
+    
+    tibble(rmse = rmse, lambda = x)
+  })
+  
+  rmse
+})
+
+
+# tibble with results
+rmse_bootstrapping_df <- bind_cols(lapply(rmse_bootstrapping, function(x)as_tibble(x)))
+
+# defining colnames of tibble
+colnames(rmse_bootstrapping_df) <- sapply(seq_len(B), function(x){
+  c(paste("RMSE", x, sep = "_"), paste("lambda", x, sep = "_"))
+})
+
+# gather tibble
+
+rmse_bootstrapping_df_long <- rmse_bootstrapping_df %>% 
+  pivot_longer(everything(), 
+               names_to = c(".value", "bootstrap_iteration"), 
+               names_pattern = "(.*)_(.*)" )
+
+# filtering for best lambdas in all bootstrap iterations
+
+rmse_bootstrapping_df_long_best <- rmse_bootstrapping_df_long  %>% 
+  group_by(bootstrap_iteration) %>% 
+  filter(RMSE == min(RMSE)) %>% 
+  arrange(RMSE)
+
+rmse_bootstrapping_df_long_best %>% 
+  knitr::kable(caption = "best lambdas per bootstrap iteration")
+```
+
+```{r, echo = FALSE}
+rmse_bootstrapping_df_long %>% 
+  filter(bootstrap_iteration == 3) %>% 
+  ggplot(aes(lambda, RMSE))+geom_point()+geom_line()
+```
+
+
+\hfill\break 
+
+
+# Results
+
+As computed above, the optimal value for $\lambda$ seems to be 5.1. Choosing this value, a model is trained using all the edX data to predict on the validation data.
+
+```{r}
+validation <- validation %>% mutate(
+  date = lubridate::as_datetime(timestamp)) %>% 
+  mutate(week = lubridate::round_date(
+    date, unit = "week"))
+
+edx <- edx %>% mutate(
+  date = lubridate::as_datetime(timestamp)) %>% 
+  mutate(week = lubridate::round_date(
+    date, unit = "week"))
+
+# defining train_set and test_set as edx and validation
+
+train_set <- edx
+test_set <- validation
+
+lambdas <- 5.1
+
+rmse_lambdas_all <- map_df(lambdas, function(x){
+  
+  mu <- mean(train_set$rating)
+  
+  movie_effects_reg <- train_set %>% 
+    group_by(movieId) %>% 
+    summarize(b_i = sum(rating - mu)/(n()+x))
+  
+  user_effects_reg <- train_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    group_by(userId) %>% 
+    summarize(b_u = sum(rating - mu - b_i)/(n()+x)) 
+  
+  genre_effects_reg <- train_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    left_join(user_effects_reg, by = "userId") %>% 
+    group_by(genres) %>% 
+    summarize(b_g = sum(rating- mu - b_i - b_u)/(n()+x))
+  
+  week_effects_reg <- train_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    left_join(user_effects_reg, by = "userId") %>% 
+    left_join(genre_effects_reg, by = "genres") %>% 
+    group_by(week) %>% 
+    summarize(b_w = sum(rating - mu - b_i - b_u - b_g)/(n()+x))
+  
+  prediction <- test_set %>% 
+    left_join(movie_effects_reg, by = "movieId") %>% 
+    left_join(user_effects_reg, by = "userId") %>% 
+    left_join(genre_effects_reg, by = "genres") %>% 
+    left_join(week_effects_reg, by = "week") %>% 
+    mutate(pred = mu+b_i+b_u+b_g+b_w) %>% 
+    pull(pred)
+  
+  
+  rmse <- RMSE(test_set$rating, prediction)
+  
+  tibble(rmse)
+})
+
+
+rmse_lambdas_all_view <- rmse_lambdas_all %>% 
+  mutate(lambdas) %>% arrange(rmse)
+rmse_lambdas_all_view %>% 
+  knitr::kable(caption = "RMSE of the final model")
+```
+
+
+
+# Conclusion
+
+The model reaching an RMSE of `r rmse_lambdas_all_view %>% pull(rmse)` is still a rather simple model but it fulfills the expectation of the edX capstone.
+
+\hfill\break By taking into account the four effects(user-effects(u), movie-effects(i), genres-effects(g), week-effects(w)) observed in the exploratory data analysis, the prediction can be improved compared to a model, that only takes into account the mean of each movie.
+The usage of regularization leads to a further, significant improvement of the prediciton, by penalizing the influence of small number of observations.
+\hfill\break
+In order to select the tuning parameter $\lambda$ without danger of overfitting, the training dataset edx is again partitioned into a test- and train-set. A five fold bootstrap cross validation is used to select the best lambda.
+
+\hfill\break
+
+
+\hfill\break A variety  of different approaches, extensions and their combination in machine learning ensembles are possible to further improve the models performance.
+For example one could use factor analysis, principal component analysis or singular value decomposition to improve prediction accuracy of the "genres-effects" or the "movie-effects". 
+For recommendation challenges  specific packages and algorithms were developed. For example the [recommenderlab package]("https://cran.r-project.org/web/packages/recommenderlab/vignettes/recommenderlab.pdf") on CRAN.
